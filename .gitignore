@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtualenv
+.venv/
+venv/
+
+# Runtime / local data
+data/
+*.sqlite3
+
+# Secrets
+.env
+.env.*

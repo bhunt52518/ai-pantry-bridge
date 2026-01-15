@@ -1,0 +1,477 @@
+import os
+import json
+import sqlite3
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+import httpx
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+
+# -------------------------
+# Config
+# -------------------------
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+PANTRY_DB = os.path.join(DATA_DIR, "pantry.sqlite3")
+PROFILES_PATH = os.path.join(DATA_DIR, "pantry_profiles.json")
+
+
+SYSTEM_AUTOMATION = """You are a Home Assistant automation generator.
+
+RULES:
+- Output ONLY valid JSON.
+- Do NOT include markdown, comments, or explanations.
+- Do NOT include trailing commas.
+- Do NOT include text outside the JSON object.
+- All strings must be double-quoted.
+
+The JSON schema MUST be:
+{
+  "valid": true | false,
+  "summary": "short description",
+  "assumptions": [],
+  "helpers": [],
+  "triggers": [],
+  "conditions": [],
+  "actions": [],
+  "notes": []
+}
+
+REQUIREMENTS:
+- Use Home Assistant service names exactly as documented.
+- Entity IDs must be lowercase.
+- If information is missing, set "valid" to false and explain in "notes".
+- Prefer simplicity over cleverness.
+- Never invent entities.
+"""
+
+
+app = FastAPI()
+
+
+# -------------------------
+# DB helpers
+# -------------------------
+
+def pantry_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(PANTRY_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = pantry_db()
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pantry (
+      canonical TEXT PRIMARY KEY,
+      qty REAL NOT NULL,
+      unit TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS barcodes (
+      barcode TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      canonical TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+@app.on_event("startup")
+async def _startup():
+    init_db()
+
+
+# -------------------------
+# Profile + normalization
+# -------------------------
+
+def load_profiles() -> Dict[str, Any]:
+    try:
+        with open(PROFILES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def normalize_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def canonical_from_name(name: str, profiles: Dict[str, Any]) -> str:
+    n = normalize_name(name)
+
+    # direct match
+    if n in profiles:
+        return n
+
+    # alias match
+    for canon, p in profiles.items():
+        for a in p.get("aliases", []):
+            if n == normalize_name(a):
+                return canon
+
+    # fallback: use normalized string as canonical
+    return n
+
+
+def is_barcode(s: str) -> bool:
+    s = s.strip()
+    return s.isdigit() and 8 <= len(s) <= 16
+
+
+def is_url(s: str) -> bool:
+    s = s.strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
+
+
+def get_barcode_mapping(barcode: str) -> Optional[Dict[str, str]]:
+    conn = pantry_db()
+    row = conn.execute(
+        "SELECT barcode, label, canonical FROM barcodes WHERE barcode=?",
+        (barcode.strip(),)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_barcode_mapping(barcode: str, label: str, canonical: str):
+    conn = pantry_db()
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO barcodes (barcode, label, canonical, updated_at) VALUES (?,?,?,?)",
+        (barcode.strip(), label.strip(), canonical.strip(), now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def upsert_pantry(canonical: str, add_qty: float, unit: str):
+    conn = pantry_db()
+    now = datetime.utcnow().isoformat()
+
+    row = conn.execute(
+        "SELECT qty, unit FROM pantry WHERE canonical=?",
+        (canonical,)
+    ).fetchone()
+
+    if row is None:
+        conn.execute(
+            "INSERT INTO pantry (canonical, qty, unit, updated_at) VALUES (?,?,?,?)",
+            (canonical, float(add_qty), unit, now)
+        )
+    else:
+        # v1: if unit mismatches, keep existing unit (we’ll add conversions later)
+        existing_unit = row["unit"]
+        final_unit = existing_unit if existing_unit != unit else unit
+        conn.execute(
+            "UPDATE pantry SET qty=?, unit=?, updated_at=? WHERE canonical=?",
+            (float(row["qty"]) + float(add_qty), final_unit, now, canonical)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+async def notify_unknown(callback_url: Optional[str], value: str):
+    """Notify Home Assistant that a barcode/QR needs labeling."""
+    if not callback_url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(callback_url, json={"barcode": value})
+    except Exception:
+        pass
+
+
+# -------------------------
+# AI Bridge (/generate)
+# -------------------------
+
+class GenerateReq(BaseModel):
+    model: str = "qwen2.5:14b"
+    intent: str
+    callback_url: str
+
+
+def safe_json_parse(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+@app.post("/generate")
+async def generate(req: GenerateReq):
+    prompt = f"{SYSTEM_AUTOMATION}\n\nUSER INTENT:\n{req.intent}\n"
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(OLLAMA_URL, json={
+            "model": req.model,
+            "prompt": prompt,
+            "stream": False
+        })
+        r.raise_for_status()
+        raw = r.json().get("response", "").strip()
+
+    try:
+        parsed = safe_json_parse(raw)
+        summary = parsed.get("summary", "Draft created")
+        out = {
+            "summary": summary,
+            "raw": json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+        }
+    except Exception as e:
+        out = {
+            "summary": "Invalid JSON from model",
+            "raw": json.dumps({
+                "valid": False,
+                "summary": "Invalid JSON from model",
+                "assumptions": [],
+                "helpers": [],
+                "triggers": [],
+                "conditions": [],
+                "actions": [],
+                "notes": [f"{type(e).__name__}: {e}"]
+            })
+        }
+
+    # callback to HA
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(req.callback_url, json=out)
+    except Exception:
+        pass
+
+    return {"ok": True}
+
+
+# -------------------------
+# Pantry endpoints
+# -------------------------
+
+class PantryAddReq(BaseModel):
+    name: str
+    qty: Optional[float] = None
+    unit: Optional[str] = None
+    source: Optional[str] = None
+    callback_url: Optional[str] = None  # HA webhook for "unknown barcode"
+    category: Optional[str] = None
+    perishable: Optional[bool] = None
+    expires_at: Optional[str] = None  # ISO string
+    staple: Optional[bool] = None
+
+@app.post("/pantry/add")
+async def pantry_add(req: PantryAddReq):
+    profiles = load_profiles()
+    incoming = req.name.strip()
+
+    # 1) QR codes / URLs: treat like barcodes (look up mapping first)
+    if is_url(incoming):
+        mapping = get_barcode_mapping(incoming)
+        if not mapping:
+            await notify_unknown(req.callback_url, incoming)
+            return {"ok": True, "added": False, "unknown_barcode": True, "value": incoming}
+        canon = mapping["canonical"]
+
+    # 2) Numeric barcodes (UPC/EAN): resolve via mapping table
+    elif is_barcode(incoming):
+        mapping = get_barcode_mapping(incoming)
+        if not mapping:
+            await notify_unknown(req.callback_url, incoming)
+            return {"ok": True, "added": False, "unknown_barcode": True, "barcode": incoming}
+        canon = mapping["canonical"]
+
+    # 3) Normal named items
+    else:
+        canon = canonical_from_name(incoming, profiles)
+
+    # Determine qty/unit
+    add_qty = 1.0
+    unit = "count"
+
+    p = profiles.get(canon)
+
+    if req.qty is not None:
+        add_qty = float(req.qty)
+        unit = (req.unit or "count").strip().lower()
+    elif p is not None:
+        add_qty = float(p.get("default_add_qty", 1.0))
+        unit = str(p.get("unit", "count")).strip().lower()
+
+    upsert_pantry(canon, add_qty, unit)
+
+    return {
+        "ok": True,
+        "added": True,
+        "canonical": canon,
+        "added_amount": {"qty": add_qty, "unit": unit}
+    }
+
+
+@app.get("/pantry/list")
+async def pantry_list():
+    conn = pantry_db()
+    rows = conn.execute(
+        "SELECT canonical, qty, unit, category, perishable, expires_at, staple, updated_at "
+        "FROM pantry ORDER BY canonical"
+    ).fetchall()
+    conn.close()
+    return {"ok": True, "items": [dict(r) for r in rows]}
+
+
+
+class PantryDeleteReq(BaseModel):
+    canonical: str
+
+
+@app.post("/pantry/delete")
+async def pantry_delete(req: PantryDeleteReq):
+    canon = normalize_name(req.canonical)
+    conn = pantry_db()
+    cur = conn.execute("DELETE FROM pantry WHERE canonical=?", (canon,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "deleted": cur.rowcount, "canonical": canon}
+
+
+def get_pantry_item(canonical: str):
+    conn = pantry_db()
+    row = conn.execute(
+        "SELECT canonical, qty, unit FROM pantry WHERE canonical=?",
+        (canonical,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def set_pantry_qty(canonical: str, qty: float, unit: str):
+    conn = pantry_db()
+    now = datetime.utcnow().isoformat()
+    if qty <= 0:
+        conn.execute("DELETE FROM pantry WHERE canonical=?", (canonical,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO pantry (canonical, qty, unit, updated_at) VALUES (?,?,?,?)",
+            (canonical, qty, unit, now)
+        )
+    conn.commit()
+    conn.close()
+
+class PantryConsumeReq(BaseModel):
+    canonical: str
+    qty: float
+    unit: Optional[str] = None  # optional, v1 will require matching unit
+
+@app.post("/pantry/consume")
+async def pantry_consume(req: PantryConsumeReq):
+    canon = normalize_name(req.canonical)
+    item = get_pantry_item(canon)
+    if not item:
+        return {"ok": False, "error": "not_found", "canonical": canon}
+
+    current_qty = float(item["qty"])
+    current_unit = item["unit"]
+
+    use_unit = (req.unit or current_unit).strip().lower()
+    if use_unit != current_unit:
+        # v1: no conversions yet (we can add later)
+        return {
+            "ok": False,
+            "error": "unit_mismatch",
+            "canonical": canon,
+            "current_unit": current_unit,
+            "requested_unit": use_unit
+        }
+
+    new_qty = max(0.0, current_qty - float(req.qty))
+    set_pantry_qty(canon, new_qty, current_unit)
+
+    return {
+        "ok": True,
+        "canonical": canon,
+        "from": {"qty": current_qty, "unit": current_unit},
+        "to": {"qty": new_qty, "unit": current_unit}
+    }
+
+class PantrySetReq(BaseModel):
+    canonical: str
+    qty: float
+    unit: Optional[str] = None  # if omitted, keeps existing unit (or defaults to count if new)
+    category: Optional[str] = None
+    perishable: Optional[bool] = None
+    expires_at: Optional[str] = None
+    staple: Optional[bool] = None
+
+@app.post("/pantry/set")
+async def pantry_set(req: PantrySetReq):
+    canon = normalize_name(req.canonical)
+
+    # If item exists, keep its unit unless caller explicitly sets unit
+    existing = get_pantry_item(canon)
+    if existing:
+        current_unit = existing["unit"]
+        target_unit = (req.unit or current_unit).strip().lower()
+        if target_unit != current_unit and req.unit is not None:
+            # v1: no conversions (we can add later)
+            return {
+                "ok": False,
+                "error": "unit_mismatch",
+                "canonical": canon,
+                "current_unit": current_unit,
+                "requested_unit": target_unit
+            }
+        final_unit = current_unit if req.unit is None else target_unit
+    else:
+        # New item: default unit is count unless provided
+        final_unit = (req.unit or "count").strip().lower()
+
+    new_qty = max(0.0, float(req.qty))
+    set_pantry_qty(canon, new_qty, final_unit)
+
+    return {
+        "ok": True,
+        "canonical": canon,
+        "to": {"qty": new_qty, "unit": final_unit}
+    }
+
+
+# -------------------------
+# Barcode endpoints
+# -------------------------
+
+class BarcodeTeachReq(BaseModel):
+    barcode: str
+    label: str
+
+
+@app.post("/barcode/teach")
+async def barcode_teach(req: BarcodeTeachReq):
+    profiles = load_profiles()
+    canon = canonical_from_name(req.label, profiles)
+    set_barcode_mapping(req.barcode.strip(), req.label.strip(), canon)
+    return {"ok": True, "barcode": req.barcode.strip(), "label": req.label.strip(), "canonical": canon}
+
+
+# NOTE: This endpoint works best for numeric barcodes.
+# URLs contain slashes and may not work nicely in a path parameter.
+# Use /barcode/teach for URLs (it stores fine), and verify via DB or scans.
+@app.get("/barcode/resolve/{barcode}")
+async def barcode_resolve(barcode: str):
+    m = get_barcode_mapping(barcode.strip())
+    if not m:
+        return {"ok": False, "known": False, "barcode": barcode.strip()}
+    return {"ok": True, "known": True, "barcode": m["barcode"], "label": m["label"], "canonical": m["canonical"]}
