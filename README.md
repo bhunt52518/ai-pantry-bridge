@@ -1,3 +1,23 @@
+AI Pantry Bridge is a local-first pantry and recipe planning service designed to integrate cleanly with Home Assistant.
+
+The system combines deterministic inventory and recipe logic with LLM-assisted parsing and natural language generation, while keeping all state changes explicit, inspectable, and human-approved.
+
+It is structured as a modular FastAPI application backed by SQLite, with a locally hosted LLM (Qwen via Ollama) used only for interpretation and language — never as a source of truth.
+
+This project serves both as a practical household automation tool and as a reference architecture for building reliable, AI-assisted systems without ceding control to probabilistic components.
+
+### Why this exists
+
+Many AI-enabled automations fail not because the models are weak, but because system boundaries are unclear.
+
+This project was built to explore an alternative approach:
+- Deterministic systems own truth and state
+- LLMs assist with interpretation, parsing, and explanation
+- Humans remain in the decision loop for irreversible actions
+
+The result is a system that benefits from AI without sacrificing predictability or debuggability.
+
+
 AI Pantry & Recipe Bridge
 
 Home Assistant–Integrated, Local-First Pantry & Recipe System
