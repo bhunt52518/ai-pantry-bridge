@@ -275,3 +275,7 @@ Ollama (local)
 Home Assistant (recommended)
 
 Exact setup steps vary by environment.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
