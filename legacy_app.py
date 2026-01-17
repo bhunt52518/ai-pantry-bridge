@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any, List, Literal
 
 import httpx
 from fastapi import FastAPI
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 from ollama_client import OllamaClient
@@ -137,6 +138,15 @@ async def speech_format(req: SpeechFormatRequest):
             return resp2
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"LLM speech format failed: {e}")
+
+def _item_to_name(x):
+    # Accept dicts like {"canonical": "..."} or {"name": "..."} or plain strings
+    if isinstance(x, dict):
+        return x.get("canonical") or x.get("name") or x.get("item") or ""
+    if isinstance(x, str):
+        return x
+    return str(x)
+
 
 def _find_jsonld_scripts(html: str) -> List[str]:
     """
@@ -1446,7 +1456,8 @@ async def recipe_parse_diff(req: RecipeParseDiffReq):
     # 4) Attach recipe context (handy for HA)
     result["recipe"] = {
         "title": parsed.title,
-        "source_url": parsed.source_url or req.url
+        "source_url": parsed.source_url or req.url,
+        "steps": parsed.steps,
     }
     return result
 @app.post("/recipe/parse_diff_speech")
@@ -1497,9 +1508,20 @@ async def recipe_parse_diff_notify(req: RecipeParseDiffReq):
     # 1) Use your existing parse+diff endpoint
     diff = await recipe_parse_diff(req)
 
-    # 2) Make a compact summary for speech formatting
-    missing = diff.get("missing", []) or []
-    partial = diff.get("partial", []) or []
+    # 2) Normalize missing/partial to lists of strings (handles dicts or strings)
+    def _item_to_name(x):
+        if isinstance(x, dict):
+            return x.get("canonical") or x.get("name") or x.get("item") or ""
+        if isinstance(x, str):
+            return x
+        return str(x)
+
+    missing_raw = diff.get("missing", []) or []
+    partial_raw = diff.get("partial", []) or []
+
+    missing = [n for n in (_item_to_name(x).strip() for x in missing_raw) if n]
+    partial = [n for n in (_item_to_name(x).strip() for x in partial_raw) if n]
+
     can_make = bool(diff.get("can_make"))
     title = (diff.get("recipe") or {}).get("title") or "that recipe"
 
@@ -1508,23 +1530,36 @@ async def recipe_parse_diff_notify(req: RecipeParseDiffReq):
     else:
         need_count = len(missing) + len(partial)
         top = []
-        for m in (missing + partial):
-            c = m.get("canonical")
+        for c in (missing + partial):
             if c and c not in top:
                 top.append(c)
             if len(top) >= 3:
                 break
+
         if top:
-            summary = f"You can’t fully make {title}. You’re short {need_count} items, like {', '.join(top)}. Want me to add them to your shopping list?"
+            summary = (
+                f"You can’t fully make {title}. You’re short {need_count} items, like "
+                f"{', '.join(top)}. Want me to add them to your shopping list?"
+            )
         else:
             summary = f"You can’t fully make {title}. You’re short {need_count} items. Want me to add them to your shopping list?"
 
     # 3) Format speech using your existing formatter
     speech_obj = await speech_format(SpeechFormatRequest(text=summary))
 
-    # 4) Push to HA webhook (HA automation sends phone notification)
+    # 4) Push FULL structured payload to HA webhook (HA automation sends phone notification)
+    payload = {
+        "speech": speech_obj.speech,
+        "url": req.url,
+        "mode": req.mode,
+        "recipe": diff.get("recipe", {}),
+        "missing": missing,
+        "partial": partial,
+    }
+
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(HA_WEBHOOK_SPEECH_URL, json={"speech": speech_obj.speech})
+        r = await client.post(HA_WEBHOOK_SPEECH_URL, json=payload)
         r.raise_for_status()
 
     return {"ok": True, "notified": True, "speech": speech_obj.speech}
+
