@@ -12,7 +12,7 @@ data/pantry.sqlite3
 data/*sqlite3
 data/*.json
 secrets.yaml
-
+data/
 # Secrets
 .env
 .env.*
