@@ -1,118 +1,177 @@
-# ai-pantry-bridge-README.md
+AI Pantry & Recipe Bridge
 
-# AI Pantry & Recipe Planner (Home Assistant Integration)
+Home Assistant–Integrated, Local-First Pantry & Recipe System
 
-A local-first pantry and recipe planning system integrated with Home Assistant, backed by SQLite and augmented by a local LLM (Qwen via Ollama).
+AI Pantry Bridge is a local-first pantry and recipe planning service designed to integrate tightly with Home Assistant.
+It combines deterministic inventory logic with LLM-assisted understanding and language, while keeping all state changes predictable, auditable, and human-approved.
 
-The system combines **deterministic inventory logic** with **LLM-powered understanding and natural language**, while keeping all state changes safe and predictable.
+The system runs entirely on your local network using FastAPI, SQLite, and a local LLM (Qwen via Ollama).
 
----
-
-## Architecture Overview
-
+Architecture Overview
 Home Assistant
-|
-| REST
-v
-AI Bridge (FastAPI)
-|
-| SQLite
-v
-Pantry Database
+     |
+     | REST / Webhooks
+     v
+AI Bridge (FastAPI) ────→ SQLite (Pantry, Recipes)
+     |
+     └──→ Ollama (Qwen)
+           ^
+           |
+       Open WebUI
 
-AI Bridge ──→ Ollama (Qwen)
-^
-|
+Design intent
+
+Home Assistant orchestrates automations, notifications, and user interaction
+
+AI Bridge owns all inventory and recipe logic
+
+LLMs assist, but never mutate state directly
+
+Components
+Home Assistant
+
+Automations, scripts, and mobile notifications
+
+Voice (Siri / Assist / Echo)
+
+Calls AI Bridge via REST
+
+Receives results via webhooks
+
+Does not manage inventory logic directly
+
+AI Bridge (FastAPI)
+
+Stateless HTTP API
+
+Deterministic pantry + recipe logic
+
+SQLite-backed persistence
+
+Modular router/service architecture
+
+Managed via systemd
+
+Ollama / Qwen
+
+Local LLM inference
+
+Used only for:
+
+Parsing recipe text / webpages
+
+Generating natural language responses
+
+Never:
+
+Alters inventory
+
+Makes truth decisions
+
+Writes to the database
+
 Open WebUI
 
+Web UI for Ollama
 
----
+Prompt iteration and testing
 
-## Components
+Not part of the runtime pipeline
 
-### Home Assistant
-- Handles automations, scripts, notifications, and voice
-- Calls the AI Bridge via REST
-- Does not manage inventory logic directly
+Network & Ports (Defaults)
+Component	Address / Port
+Home Assistant	HOME_ASSISTANT_IP:8123
+AI Bridge API	AI_BRIDGE_IP:8090
+Open WebUI	AI_BRIDGE_IP:3000
+Ollama API	127.0.0.1:11434
 
-### AI Bridge (FastAPI)
-- Stateless HTTP API
-- Deterministic inventory and recipe logic
-- SQLite-backed persistence
-- Systemd-managed service
+All addresses are configurable.
 
-### Ollama / Qwen
-- Local LLM inference
-- Used **only** for:
-  - Parsing human recipe text into structured data
-  - Generating natural-language responses
-- Never mutates inventory or makes truth decisions
+Database
 
-### Open WebUI
-- Web UI for interacting with Ollama models
-- Used for prompt development and testing
+SQLite (local file, not committed)
 
----
+Tables
 
-## Network & Ports (Configurable)
+pantry – canonical inventory items
 
-| Component      | Default |
-|----------------|---------|
-| Home Assistant | `HOME_ASSISTANT_IP:8123` |
-| AI Bridge API  | `AI_BRIDGE_IP:8090` |
-| Open WebUI     | `AI_BRIDGE_IP:3000` |
-| Ollama API     | `127.0.0.1:11434` |
+barcodes – barcode → canonical mappings
 
-> All addresses are configurable. Defaults assume a local network.
+recipes – normalized parsed recipes
 
----
+recipes_raw – raw recipe payload archive
 
-## Database
+Schema is created / validated at startup.
 
-**SQLite file**
+API Endpoints
+Pantry
 
+POST /pantry/upsert
 
-### Tables
-- `pantry`
-- `barcodes`
-- `recipes`
+POST /pantry/adjust
 
-Database schema is automatically created/validated at startup.
+GET /pantry/items
 
----
+GET /pantry/get/{name}
 
-## API Endpoints
+DELETE /pantry/delete/{name}
 
-### Pantry
-- `POST /pantry/add`
-- `GET  /pantry/list`
-- `POST /pantry/set`
-- `POST /pantry/consume`
-- `POST /pantry/delete`
+Barcodes
 
-### Barcodes
-- `POST /barcode/teach`
-- `GET  /barcode/resolve/{barcode}`
+POST /barcode/teach
 
-### Recipes
-- `POST /recipe/save`
-- `GET  /recipe/list`
-- `GET  /recipe/get/{id}`
-- `POST /recipe/diff`
-- `POST /recipe/plan`
-- `POST /recipe/apply`
+GET /barcode/resolve/{barcode}
 
-### LLM-Backed (Optional)
-- `POST /recipe/parse` – recipe text → structured ingredients
-- `POST /speech/format` – structured data → natural language
+Recipes
 
----
+POST /recipe/parse
+Parse a recipe URL into structured data (LLM-assisted)
 
-## Home Assistant Integration
+POST /recipe/parse_and_save
+Parse and persist a recipe
 
-Example `rest_command`:
+POST /recipe/plan
+Parse recipe → diff against pantry → notify Home Assistant
 
-```yaml
+GET /recipe/list
+
+GET /recipe/get/{id}
+
+Language / Speech
+
+POST /speech/format
+Structured data → natural language / SSML
+
+Automation Generation (Optional)
+
+POST /generate
+LLM-assisted Home Assistant automation JSON generation
+(Does not trigger pantry notifications)
+
+Home Assistant Integration
+Recipe planning → phone notification flow
+
+HA calls POST /recipe/plan
+
+AI Bridge:
+
+Parses the recipe
+
+Diffs ingredients vs pantry
+
+Builds missing / partial
+
+Sends payload to HA webhook
+
+HA:
+
+Stores payload
+
+Sends actionable mobile notification
+
+Buttons trigger follow-up automations
+
+Example rest_command
 rest_command:
   ai_bridge_recipe_plan:
     url: "http://AI_BRIDGE_IP:8090/recipe/plan"
@@ -120,53 +179,68 @@ rest_command:
     headers:
       Content-Type: application/json
     payload: >
-      {"max_results": {{ max_results | default(5) }}}
-
-A sample script is included to answer:
-
-“What can I make?”
+      {
+        "url": "{{ recipe_url }}",
+        "callback_url": "http://HOME_ASSISTANT_IP:8123/api/webhook/AI_BRIDGE_WEBHOOK_ID"
+      }
 
 Design Principles
-
 Deterministic Core
 
 Inventory math
 
-Unit handling
+Canonical item naming
 
-Consumption rules
+Explicit state changes only
 
 LLM as Assistant
 
-Text parsing
+Parsing
 
 Language generation
 
-Local-first
+Suggestions, not decisions
+
+Local-First
 
 No cloud dependency
 
 All data stored locally
 
-Human-in-the-loop
+Works offline
+
+Human-in-the-Loop
 
 Barcode teaching
 
-Alias confirmation
+Confirmation before shopping list changes
 
-Safe failure modes
+Actionable notifications
+
+Safe Failure Modes
+
+Invalid LLM output rejected
+
+Inventory never mutates implicitly
+
+Notifications are optional, not required
 
 Status
 
-✅ Pantry management complete
-
-✅ Recipe planning and ranking
-
+✅ Pantry management
+✅ Barcode learning
+✅ Recipe parsing and storage
+✅ Pantry diff + phone notifications
 ✅ Home Assistant integration
+✅ Local LLM via Ollama
 
-✅ Local LLM support via Ollama
+🚧 Ongoing:
 
-🚧 Ongoing: advanced parsing and voice interaction
+Smarter quantity/unit reasoning
+
+Voice-first flows
+
+Multi-recipe planning
 
 Setup Notes
 
@@ -178,6 +252,6 @@ SQLite
 
 Ollama (local)
 
-Home Assistant (optional but recommended)
+Home Assistant (recommended)
 
-Exact setup steps may vary depending on environment.
+Exact setup steps vary by environment.
