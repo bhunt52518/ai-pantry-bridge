@@ -8,6 +8,11 @@ DATA_DIR = PROJECT_ROOT / "data"
 PANTRY_DB = DATA_DIR / "pantry.sqlite3"
 PROFILES_PATH = DATA_DIR / "pantry_profiles.json"
 
+# --- Version / build metadata (override via systemd env) ---
+APP_VERSION = os.getenv("APP_VERSION", "1.0.1")
+GIT_SHA = os.getenv("GIT_SHA", "unknown")
+BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
+
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "qwen2.5:14b"
